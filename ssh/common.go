@@ -49,6 +49,7 @@ var supportedKexAlgos = []string{
 	// reuse ephemeral keys, using them for ECDH should be OK.
 	kexAlgoECDH256, kexAlgoECDH384, kexAlgoECDH521,
 	kexAlgoDH14SHA1, kexAlgoDH1SHA1,
+	kexAlgoDHGexSHA1, kexAlgoDHGexSHA256, // dhgex.patch added this line
 }
 
 // supportedHostKeyAlgos specifies the supported host-key algorithms (i.e. methods

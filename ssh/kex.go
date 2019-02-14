@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 
@@ -18,13 +19,30 @@ import (
 )
 
 const (
-	kexAlgoDH1SHA1          = "diffie-hellman-group1-sha1"
-	kexAlgoDH14SHA1         = "diffie-hellman-group14-sha1"
+	kexAlgoDH1SHA1  = "diffie-hellman-group1-sha1"
+	kexAlgoDH14SHA1 = "diffie-hellman-group14-sha1"
+
+	// dhgex.patch added next two lines
+	kexAlgoDHGexSHA1   = "diffie-hellman-group-exchange-sha1"
+	kexAlgoDHGexSHA256 = "diffie-hellman-group-exchange-sha256"
+
 	kexAlgoECDH256          = "ecdh-sha2-nistp256"
 	kexAlgoECDH384          = "ecdh-sha2-nistp384"
 	kexAlgoECDH521          = "ecdh-sha2-nistp521"
 	kexAlgoCurve25519SHA256 = "curve25519-sha256@libssh.org"
 )
+
+// dhgex.patch added kexAlgoMap
+var kexAlgoMap = map[string]kexAlgorithm{
+	kexAlgoDH1SHA1:          &dhGroupKexAlgo{group: &dhGroup1, hash: crypto.SHA1},
+	kexAlgoDH14SHA1:         &dhGroupKexAlgo{group: &dhGroup14, hash: crypto.SHA1},
+	kexAlgoDHGexSHA1:        &dhGroupExchangeKexAlgo{hash: crypto.SHA1},
+	kexAlgoDHGexSHA256:      &dhGroupExchangeKexAlgo{hash: crypto.SHA256},
+	kexAlgoECDH256:          &ecdh{elliptic.P256()},
+	kexAlgoECDH384:          &ecdh{elliptic.P384()},
+	kexAlgoECDH521:          &ecdh{elliptic.P521()},
+	kexAlgoCurve25519SHA256: &curve25519sha256{},
+}
 
 // kexResult captures the outcome of a key exchange.
 type kexResult struct {
@@ -77,31 +95,60 @@ type kexAlgorithm interface {
 
 // dhGroup is a multiplicative group suitable for implementing Diffie-Hellman key agreement.
 type dhGroup struct {
-	g, p, pMinus1 *big.Int
+	g, p *big.Int // dhgex.patch replacement
 }
 
 func (group *dhGroup) diffieHellman(theirPublic, myPrivate *big.Int) (*big.Int, error) {
-	if theirPublic.Cmp(bigOne) <= 0 || theirPublic.Cmp(group.pMinus1) >= 0 {
+	if theirPublic.Cmp(bigOne) <= 0 || theirPublic.Cmp(group.p) >= 0 { // dhgex.patch replacement
 		return nil, errors.New("ssh: DH parameter out of bounds")
 	}
 	return new(big.Int).Exp(theirPublic, myPrivate, group.p), nil
 }
 
-func (group *dhGroup) Client(c packetConn, randSource io.Reader, magics *handshakeMagics) (*kexResult, error) {
-	hashFunc := crypto.SHA1
-
+// dhgex.patch new func def, removed first line of old func
+func (group *dhGroup) keyPair(randSource io.Reader) (public, private *big.Int, err error) {
 	var x *big.Int
 	for {
 		var err error
-		if x, err = rand.Int(randSource, group.pMinus1); err != nil {
-			return nil, err
+		// dhgex.patch replaced next two lines
+		if x, err = rand.Int(randSource, group.p); err != nil {
+			return nil, nil, err
 		}
 		if x.Sign() > 0 {
 			break
 		}
 	}
 
+	// dhgex.patch added if block
+	if err != nil {
+		return nil, nil, err
+	}
+
 	X := new(big.Int).Exp(group.g, x, group.p)
+
+	// dhgex.patch added return and ended function
+	return X, x, nil
+}
+
+// dhgex.patch added bits function
+func (group *dhGroup) bits() int {
+	return group.p.BitLen()
+}
+
+// dhgex.patch added dhGroupKexAlgo struct
+// dhGroupKexAlgo is a key exchange algorithm using a particular MODP group and hash
+type dhGroupKexAlgo struct {
+	group *dhGroup
+	hash  crypto.Hash
+}
+
+// dhgex.patch added next 5 lines
+func (algo *dhGroupKexAlgo) Client(c packetConn, randSource io.Reader, magics *handshakeMagics) (*kexResult, error) {
+	X, x, err := algo.group.keyPair(randSource)
+	if err != nil {
+		return nil, err
+	}
+
 	kexDHInit := kexDHInitMsg{
 		X: X,
 	}
@@ -119,12 +166,14 @@ func (group *dhGroup) Client(c packetConn, randSource io.Reader, magics *handsha
 		return nil, err
 	}
 
-	ki, err := group.diffieHellman(kexDHReply.Y, x)
+	// dhgex.patch - replaced next line
+	ki, err := algo.group.diffieHellman(kexDHReply.Y, x)
 	if err != nil {
 		return nil, err
 	}
 
-	h := hashFunc.New()
+	// dhgex.patch - replaced next line
+	h := algo.hash.New()
 	magics.write(h)
 	writeString(h, kexDHReply.HostKey)
 	writeInt(h, X)
@@ -138,12 +187,13 @@ func (group *dhGroup) Client(c packetConn, randSource io.Reader, magics *handsha
 		K:         K,
 		HostKey:   kexDHReply.HostKey,
 		Signature: kexDHReply.Signature,
-		Hash:      crypto.SHA1,
+		// dhgex.patch replaced next line
+		Hash: algo.hash,
 	}, nil
 }
 
-func (group *dhGroup) Server(c packetConn, randSource io.Reader, magics *handshakeMagics, priv Signer) (result *kexResult, err error) {
-	hashFunc := crypto.SHA1
+// dhgex.patch new function def, removed first line of old func too
+func (algo *dhGroupKexAlgo) Server(c packetConn, randSource io.Reader, magics *handshakeMagics, priv Signer) (result *kexResult, err error) {
 	packet, err := c.readPacket()
 	if err != nil {
 		return
@@ -153,25 +203,22 @@ func (group *dhGroup) Server(c packetConn, randSource io.Reader, magics *handsha
 		return
 	}
 
-	var y *big.Int
-	for {
-		if y, err = rand.Int(randSource, group.pMinus1); err != nil {
-			return
-		}
-		if y.Sign() > 0 {
-			break
-		}
+	// dhgex.patch replaced for loop
+	Y, y, err := algo.group.keyPair(randSource)
+	if err != nil {
+		return nil, err
 	}
 
-	Y := new(big.Int).Exp(group.g, y, group.p)
-	ki, err := group.diffieHellman(kexDHInit.X, y)
+	// dhgex.patch removed 1, replaced next here
+	ki, err := algo.group.diffieHellman(kexDHInit.X, y)
 	if err != nil {
 		return nil, err
 	}
 
 	hostKeyBytes := priv.PublicKey().Marshal()
 
-	h := hashFunc.New()
+	// dhgex.patch replaced next line
+	h := algo.hash.New()
 	magics.write(h)
 	writeString(h, hostKeyBytes)
 	writeInt(h, kexDHInit.X)
@@ -203,7 +250,8 @@ func (group *dhGroup) Server(c packetConn, randSource io.Reader, magics *handsha
 		K:         K,
 		HostKey:   hostKeyBytes,
 		Signature: sig,
-		Hash:      crypto.SHA1,
+		// dhgex.patch replaced next line
+		Hash: algo.hash,
 	}, nil
 }
 
@@ -261,6 +309,254 @@ func (kex *ecdh) Client(c packetConn, rand io.Reader, magics *handshakeMagics) (
 		HostKey:   reply.HostKey,
 		Signature: reply.Signature,
 		Hash:      ecHash(kex.curve),
+	}, nil
+}
+
+// dhgex.patch - added code up to the unmarshalECKey func here
+func mustParseBigIntHex(h string) *big.Int {
+	p, ok := new(big.Int).SetString(h, 16)
+	if !ok {
+		panic(fmt.Errorf("not a hex string: %q", h))
+	}
+	return p
+}
+
+var (
+	two = new(big.Int).SetInt64(2)
+
+	// 1024-bit MODP group - Oakley Group 2 in RFC 2409.
+	// It's used in diffie-hellman-group1-sha1 in RFC 4253.
+	dhGroup1 = dhGroup{
+		g: two,
+		p: mustParseBigIntHex("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF"),
+	}
+
+	// 2048-bit MODP group - Group 14 in RFC 3526.
+	// It's used in diffie-hellman-group14-sha1 in RFC 4253.
+	dhGroup14 = dhGroup{
+		g: two,
+		p: mustParseBigIntHex("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF"),
+	}
+
+	// 4096-bit MODP group - Group 16 in RFC 3526.
+	dhGroup16 = dhGroup{
+		g: two,
+		p: mustParseBigIntHex("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF"),
+	}
+
+	// 8192-bit MODP group - Group 18 in RFC 3526.
+	dhGroup18 = dhGroup{
+		g: two,
+		p: mustParseBigIntHex("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BDF8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1BDB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AACC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55CDA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DBE115974A3926F12FEE5E438777CB6A932DF8CD8BEC4D073B931BA3BC832B68D9DD300741FA7BF8AFC47ED2576F6936BA424663AAB639C5AE4F5683423B4742BF1C978238F16CBE39D652DE3FDB8BEFC848AD922222E04A4037C0713EB57A81A23F0C73473FC646CEA306B4BCBC8862F8385DDFA9D4B7FA2C087E879683303ED5BDD3A062B3CF5B3A278A66D2A13F83F44F82DDF310EE074AB6A364597E899A0255DC164F31CC50846851DF9AB48195DED7EA1B1D510BD7EE74D73FAF36BC31ECFA268359046F4EB879F924009438B481C6CD7889A002ED5EE382BC9190DA6FC026E479558E4475677E9AA9E3050E2765694DFC81F56E880B96E7160C980DD98EDD3DFFFFFFFFFFFFFFFFF"),
+	}
+)
+
+type dhGroupExchangeKexAlgo struct {
+	hash crypto.Hash
+}
+
+const (
+	dhGroupMinimumBits   = 2048
+	dhGroupPreferredBits = 2048
+	dhGroupMaximumBits   = 8192
+)
+
+func (algo *dhGroupExchangeKexAlgo) Client(c packetConn, randSource io.Reader, magics *handshakeMagics) (*kexResult, error) {
+	request := kexDHGexRequestMsg{
+		Min: dhGroupMinimumBits,
+		N:   dhGroupPreferredBits,
+		Max: dhGroupMaximumBits,
+	}
+	serialized := Marshal(&request)
+	if err := c.writePacket(serialized); err != nil {
+		return nil, err
+	}
+
+	packet, err := c.readPacket()
+	if err != nil {
+		return nil, err
+	}
+
+	var groupMsg kexDHGexGroupMsg
+	if err = Unmarshal(packet, &groupMsg); err != nil {
+		return nil, err
+	}
+
+	group := &dhGroup{
+		p: groupMsg.P,
+		g: groupMsg.G,
+	}
+
+	bits := uint32(group.bits())
+	if bits < request.Min || bits > request.Max {
+		return nil, errors.New("ssh: DH group out of range")
+	}
+	X, x, err := group.keyPair(randSource)
+	if err != nil {
+		return nil, err
+	}
+	init := kexDHGexInitMsg{
+		X: X,
+	}
+	if err := c.writePacket(Marshal(&init)); err != nil {
+		return nil, err
+	}
+
+	packet, err = c.readPacket()
+	if err != nil {
+		return nil, err
+	}
+
+	var reply kexDHGexReplyMsg
+	if err = Unmarshal(packet, &reply); err != nil {
+		return nil, err
+	}
+
+	kInt, err := group.diffieHellman(reply.Y, x)
+	if err != nil {
+		return nil, err
+	}
+
+	h := algo.hash.New()
+	magics.write(h)
+	writeString(h, reply.HostKey)
+	var int32Buf = make([]byte, 4)
+	marshalUint32(int32Buf, request.Min)
+	h.Write(int32Buf)
+	marshalUint32(int32Buf, request.N)
+	h.Write(int32Buf)
+	marshalUint32(int32Buf, request.Max)
+	h.Write(int32Buf)
+	writeInt(h, group.p)
+	writeInt(h, group.g)
+	writeInt(h, X)
+	writeInt(h, reply.Y)
+
+	K := make([]byte, intLength(kInt))
+	marshalInt(K, kInt)
+	h.Write(K)
+
+	return &kexResult{
+		H:         h.Sum(nil),
+		K:         K,
+		HostKey:   reply.HostKey,
+		Signature: reply.Signature,
+		Hash:      algo.hash,
+	}, nil
+}
+
+func chooseDHGroup(min, n, max uint32) (*dhGroup, error) {
+	if n < dhGroupMinimumBits {
+		n = dhGroupMinimumBits
+	} else if n > dhGroupMaximumBits {
+		n = dhGroupMaximumBits
+	}
+	if n < min || n > max {
+		return nil, errors.New("ssh: DH group out of range")
+	}
+	// For now we only use the constant groups from the RFCs
+	// TODO: Use the moduli file /etc/ssh/moduli if it exists.
+	for _, group := range []*dhGroup{&dhGroup14, &dhGroup16, &dhGroup18} {
+		if n <= uint32(group.bits()) {
+			return group, nil
+		}
+	}
+	// We should never get here as long as dhGroupMaximumBits <= dhGroup18.bits(), which it is.
+	panic("NOTREACHED")
+}
+
+func (algo *dhGroupExchangeKexAlgo) Server(c packetConn, randSource io.Reader, magics *handshakeMagics, priv Signer) (result *kexResult, err error) {
+	packet, err := c.readPacket()
+	if err != nil {
+		return nil, err
+	}
+
+	var request kexDHGexRequestMsg
+	if err = Unmarshal(packet, &request); err != nil {
+		return nil, err
+	}
+
+	group, err := chooseDHGroup(request.Min, request.N, request.Max)
+	if err != nil {
+		return nil, err
+	}
+
+	groupMsg := kexDHGexGroupMsg{
+		P: group.p,
+		G: group.g,
+	}
+
+	serialized := Marshal(&groupMsg)
+	if err := c.writePacket(serialized); err != nil {
+		return nil, err
+	}
+
+	packet, err = c.readPacket()
+	if err != nil {
+		return
+	}
+	var init kexDHGexInitMsg
+	if err = Unmarshal(packet, &init); err != nil {
+		return
+	}
+
+	Y, y, err := group.keyPair(randSource)
+	if err != nil {
+		return nil, err
+	}
+	kInt, err := group.diffieHellman(init.X, y)
+	if err != nil {
+		return nil, err
+	}
+
+	hostKeyBytes := priv.PublicKey().Marshal()
+
+	h := algo.hash.New()
+	magics.write(h)
+	writeString(h, hostKeyBytes)
+	var int32Buf = make([]byte, 4)
+	marshalUint32(int32Buf, request.Min)
+	h.Write(int32Buf)
+	marshalUint32(int32Buf, request.N)
+	h.Write(int32Buf)
+	marshalUint32(int32Buf, request.Max)
+	h.Write(int32Buf)
+	writeInt(h, group.p)
+	writeInt(h, group.g)
+	writeInt(h, init.X)
+	writeInt(h, Y)
+
+	K := make([]byte, intLength(kInt))
+	marshalInt(K, kInt)
+	h.Write(K)
+
+	H := h.Sum(nil)
+
+	// H is already a hash, but the hostkey signing will apply its
+	// own key-specific hash algorithm.
+	sig, err := signAndMarshal(priv, randSource, H)
+	if err != nil {
+		return nil, err
+	}
+
+	reply := kexDHGexReplyMsg{
+		HostKey:   hostKeyBytes,
+		Y:         Y,
+		Signature: sig,
+	}
+	packet = Marshal(&reply)
+
+	err = c.writePacket(packet)
+	if err != nil {
+		return nil, err
+	}
+
+	return &kexResult{
+		H:         H,
+		K:         K,
+		HostKey:   hostKeyBytes,
+		Signature: sig,
+		Hash:      algo.hash,
 	}, nil
 }
 
@@ -376,33 +672,7 @@ func (kex *ecdh) Server(c packetConn, rand io.Reader, magics *handshakeMagics, p
 	}, nil
 }
 
-var kexAlgoMap = map[string]kexAlgorithm{}
-
-func init() {
-	// This is the group called diffie-hellman-group1-sha1 in RFC
-	// 4253 and Oakley Group 2 in RFC 2409.
-	p, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF", 16)
-	kexAlgoMap[kexAlgoDH1SHA1] = &dhGroup{
-		g:       new(big.Int).SetInt64(2),
-		p:       p,
-		pMinus1: new(big.Int).Sub(p, bigOne),
-	}
-
-	// This is the group called diffie-hellman-group14-sha1 in RFC
-	// 4253 and Oakley Group 14 in RFC 3526.
-	p, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
-
-	kexAlgoMap[kexAlgoDH14SHA1] = &dhGroup{
-		g:       new(big.Int).SetInt64(2),
-		p:       p,
-		pMinus1: new(big.Int).Sub(p, bigOne),
-	}
-
-	kexAlgoMap[kexAlgoECDH521] = &ecdh{elliptic.P521()}
-	kexAlgoMap[kexAlgoECDH384] = &ecdh{elliptic.P384()}
-	kexAlgoMap[kexAlgoECDH256] = &ecdh{elliptic.P256()}
-	kexAlgoMap[kexAlgoCurve25519SHA256] = &curve25519sha256{}
-}
+// dhgex.patch - removed func init() and declaration of kexAlgoMap
 
 // curve25519sha256 implements the curve25519-sha256@libssh.org key
 // agreement protocol, as described in
