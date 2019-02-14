@@ -2,6 +2,8 @@
 
 This repository holds supplementary Go cryptography libraries.
 
+Changed by Device42 to support kexAlgoDHGexSHA1, kexAlgoDHGexSHA256
+
 ## Download/Install
 
 The easiest way to install is to run `go get -u golang.org/x/crypto/...`. You
